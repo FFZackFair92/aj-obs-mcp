@@ -21,6 +21,8 @@ Server MCP per **OBS Studio**: Claude (o qualsiasi client MCP) gestisce scene, s
 
 3. Riavvia Claude Desktop.
 
+**Aprire OBS da solo**: chiedi a Claude “apri OBS” (tool `open_obs`), oppure da terminale `uv run --script obs_mcp.py --open` (opzioni `--collection NOME`, `--scene NOME`, `--profile NOME`, `--tray`). Trova `obs64.exe` (registro di Windows, Program Files, Steam o `AJ_OBS_EXE`), se il server WebSocket è spento lo attiva nella config di OBS (con OBS chiuso; tiene porta e password, ne crea una se manca), avvia OBS e aspetta che risponda. Non avvia mai diretta o registrazione.
+
 Variabili opzionali: `OBS_URL` (default `ws://127.0.0.1:4455`), `OBS_PASSWORD`, `AJ_OBS_EXE` (percorso di `obs64.exe` per `open_obs`), `AJ_OBS_LOOKS` (dove salvare i look, default `~/.aj-mcp/obs-looks.json`).
 
 Prova con OBS aperto: `uv run --script check_live.py` (crea una scena temporanea `_aj_check` e la cancella; non tocca diretta, registrazione né le tue scene).
@@ -30,7 +32,7 @@ Prova senza OBS: `uv run --with "mcp[cli]>=1.10,<3" python tests/test_offline.py
 
 | Area | Tool |
 |---|---|
-| Generale | `obs_status`, `obs_request` (qualsiasi richiesta obs-websocket), `obs_batch` (più richieste in un colpo, con `Sleep` per sequenze a tempo o al frame), `obs_events` (cosa è successo, o aspetta un evento), `hotkey`, `open_obs` |
+| Generale | `obs_status`, `obs_request` (qualsiasi richiesta obs-websocket), `obs_batch` (più richieste in un colpo, con `Sleep` per sequenze a tempo o al frame), `obs_events` (cosa è successo, o aspetta un evento), `hotkey`, `open_obs` (trova, configura e apre OBS da solo) |
 | Scene | `list_scenes`, `set_scene` (con transizione e durata), `create_scene`, `remove_scene`, `rename_scene`, `get_scene_items` |
 | Elementi di scena | `add_to_scene`, `set_item_layout` (preset: full, pip_bottom_right, lower_third, left_half… o box in frazioni), `set_item_transform`, `set_item_state` (visibile, blocco, ordine, blend), `duplicate_item`, `remove_item` |
 | Sorgenti | `list_inputs`, `list_input_kinds`, `create_input` (alias: text, image, media, browser, color, display, window, game, camera, mic, desktop_audio, app_audio, spout, ndi…), `get_input_settings`, `set_input_settings`, `set_text`, `rename_input`, `remove_input`, `list_property_items` (camere, finestre, mittenti Spout), `press_input_button` |

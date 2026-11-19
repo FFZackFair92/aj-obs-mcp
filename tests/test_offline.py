@@ -328,6 +328,32 @@ async def main():
     check("si riconnette da solo se OBS si riavvia", r["obs"] == "31.1.2")
 
     server.close()
+
+    print("open_obs da solo")
+    import json as _json
+    home = Path(tempfile.mkdtemp())
+    os.environ["HOME"] = str(home)
+    os.environ.pop("APPDATA", None)
+    os.environ.pop("OBS_URL", None)
+    os.environ.pop("OBS_PASSWORD", None)
+    cfgf = home / ".config/obs-studio/plugin_config/obs-websocket/config.json"
+    cfgf.parent.mkdir(parents=True)
+    s2 = socket.socket(); s2.bind(("127.0.0.1", 0)); port2 = s2.getsockname()[1]; s2.close()
+    cfgf.write_text(_json.dumps({"server_enabled": False, "server_port": port2, "auth_required": True, "server_password": ""}))
+    os.environ["AJ_OBS_EXE"] = str(ROOT / "tests/fake_obs_app.py")
+    m.Path.home = classmethod(lambda cls: home)  # come se fosse il PC dell'utente
+    m.obs = m.OBS()
+    m.obs_process_running = lambda: False
+    r = await m.open_obs(wait_seconds=15)
+    cfg = _json.loads(cfgf.read_text())
+    check("open_obs attiva il websocket nella config", cfg["server_enabled"] and len(cfg["server_password"]) >= 12, cfg)
+    check("open_obs avvia e si collega", r.get("started") and r.get("rpcVersion") == 1 and "server WebSocket attivato" in r.get("websocket", []), r)
+    r = await m.open_obs()
+    check("open_obs se già aperto", r.get("already_running"))
+    m.obs = m.OBS(); m.obs.url = "ws://127.0.0.1:1"
+    m.obs_process_running = lambda: True
+    check("open_obs con OBS aperto ma websocket spento", await raises(m.open_obs(), "già aperto"))
+
     print(f"\n{ok} ok, {fail} falliti")
     sys.exit(1 if fail else 0)
 

@@ -42,7 +42,7 @@ except Exception:  # mcp 2.x renamed FastMCP to MCPServer
     from mcp.server.mcpserver.exceptions import ToolError  # type: ignore
 from mcp.types import ToolAnnotations
 
-VERSION = "1.0.0"
+VERSION = "1.1.0"
 RO = ToolAnnotations(readOnlyHint=True)
 DESTRUCTIVE = ToolAnnotations(destructiveHint=True)
 
@@ -680,29 +680,98 @@ async def hotkey(name: str | None = None, key: str | None = None, shift: bool = 
 
 
 def default_obs_exe() -> str | None:
+    """Find OBS: AJ_OBS_EXE, the Windows registry, the usual install folders, then PATH."""
     if os.environ.get("AJ_OBS_EXE"):
         return os.environ["AJ_OBS_EXE"]
-    for p in (r"C:\Program Files\obs-studio\bin\64bit\obs64.exe", r"C:\Program Files (x86)\obs-studio\bin\64bit\obs64.exe",
-              "/Applications/OBS.app/Contents/MacOS/OBS", "/usr/bin/obs", "/usr/local/bin/obs"):
-        if Path(p).exists():
-            return p
-    return None
+    cands: list[Path] = []
+    if sys.platform == "win32":
+        try:
+            import winreg
+            for hive in (winreg.HKEY_LOCAL_MACHINE, winreg.HKEY_CURRENT_USER):
+                for key in (r"SOFTWARE\OBS Studio", r"SOFTWARE\WOW6432Node\OBS Studio"):
+                    try:
+                        with winreg.OpenKey(hive, key) as k:
+                            cands.append(Path(winreg.QueryValueEx(k, "")[0]) / "bin/64bit/obs64.exe")
+                    except OSError:
+                        pass
+        except ImportError:
+            pass
+        for env in ("ProgramFiles", "ProgramFiles(x86)", "ProgramW6432"):
+            if os.environ.get(env):
+                cands.append(Path(os.environ[env]) / "obs-studio/bin/64bit/obs64.exe")
+        steam = Path(os.environ.get("ProgramFiles(x86)", r"C:\Program Files (x86)")) / "Steam/steamapps/common/OBS Studio/bin/64bit/obs64.exe"
+        cands.append(steam)
+    cands += [Path("/Applications/OBS.app/Contents/MacOS/OBS"), Path.home() / "Applications/OBS.app/Contents/MacOS/OBS",
+              Path("/usr/bin/obs"), Path("/usr/local/bin/obs")]
+    for c in cands:
+        if c.exists():
+            return str(c)
+    import shutil
+    return shutil.which("obs64") or shutil.which("obs")
+
+
+def obs_process_running() -> bool:
+    try:
+        if sys.platform == "win32":
+            out = subprocess.run(["tasklist", "/FI", "IMAGENAME eq obs64.exe", "/NH"], capture_output=True, text=True, timeout=10).stdout
+            return "obs64.exe" in out.lower()
+        return subprocess.run(["pgrep", "-x", "obs" if sys.platform != "darwin" else "OBS"], capture_output=True, timeout=10).returncode == 0
+    except Exception:
+        return False
+
+
+def enable_ws_in_config() -> dict:
+    """Turn on obs-websocket in OBS's own config (only while OBS is closed: OBS reads it at start-up).
+    Keeps the existing port and password; creates a password if auth is on and none exists."""
+    bases = [b for b in obs_config_candidates() if b.exists()] or obs_config_candidates()[:1]
+    f = bases[0] / "plugin_config/obs-websocket/config.json"
+    try:
+        cfg = json.loads(f.read_text(encoding="utf-8"))
+    except Exception:
+        cfg = {}
+    changed = []
+    if not cfg.get("server_enabled"):
+        cfg["server_enabled"] = True
+        changed.append("server WebSocket attivato")
+    cfg.setdefault("server_port", 4455)
+    cfg.setdefault("auth_required", True)
+    if cfg["auth_required"] and not cfg.get("server_password"):
+        cfg["server_password"] = base64.urlsafe_b64encode(os.urandom(12)).decode().rstrip("=")
+        changed.append("password creata")
+    if changed:
+        cfg["first_load"] = False
+        cfg.setdefault("alerts_enabled", False)
+        f.parent.mkdir(parents=True, exist_ok=True)
+        f.write_text(json.dumps(cfg, indent=4), encoding="utf-8")
+    return {"file": str(f), "changed": changed, "port": cfg["server_port"], "password": cfg.get("server_password") if cfg["auth_required"] else ""}
 
 
 @mcp.tool()
 async def open_obs(scene_collection: str | None = None, profile: str | None = None, scene: str | None = None,
                    minimize_to_tray: bool = False, start_virtualcam: bool = False, start_replay_buffer: bool = False,
-                   wait_seconds: float = 30) -> dict:
-    """Launch OBS on this computer (if not already running) and wait until the websocket answers.
-    Never starts streaming or recording by itself."""
+                   wait_seconds: float = 45) -> dict:
+    """Open OBS by itself and connect: finds obs64.exe (registry, Program Files, Steam, PATH or AJ_OBS_EXE), switches
+    on OBS's WebSocket server in its config if it is off, launches OBS (optionally with a scene collection, profile,
+    scene, minimized to tray, virtual camera or replay buffer) and waits until it answers.
+    Never starts streaming or recording by itself. Use it whenever another tool says OBS is not reachable."""
     try:
         await obs.ensure()
         return {"already_running": True, **obs.info}
     except OBSError:
         pass
+    if obs_process_running():
+        raise OBSError("OBS è già aperto ma il server WebSocket non risponde: in OBS vai su Strumenti > Impostazioni "
+                       "server WebSocket > Abilita, oppure chiudi OBS e richiama open_obs (lo attivo io)")
     exe = default_obs_exe()
     if not exe:
-        raise OBSError("OBS non trovato: imposta AJ_OBS_EXE con il percorso di obs64.exe")
+        raise OBSError("OBS non trovato: installalo da obsproject.com o imposta AJ_OBS_EXE con il percorso di obs64.exe")
+    ws = {"changed": []}
+    if obs.is_local:
+        ws = enable_ws_in_config()
+        if "OBS_PASSWORD" not in os.environ:
+            obs.password = ws["password"] or ""
+        if "OBS_URL" not in os.environ:
+            obs.url = f"ws://127.0.0.1:{ws['port']}"
     args = [exe, "--disable-shutdown-check"]
     if scene_collection:
         args += ["--collection", scene_collection]
@@ -716,9 +785,11 @@ async def open_obs(scene_collection: str | None = None, profile: str | None = No
         args.append("--startvirtualcam")
     if start_replay_buffer:
         args.append("--startreplaybuffer")
-    kw: dict[str, Any] = {"cwd": str(Path(exe).parent), "stdout": subprocess.DEVNULL, "stderr": subprocess.DEVNULL}
+    kw: dict[str, Any] = {"cwd": str(Path(exe).parent), "stdin": subprocess.DEVNULL, "stdout": subprocess.DEVNULL, "stderr": subprocess.DEVNULL}
     if sys.platform == "win32":
         kw["creationflags"] = 0x00000008 | 0x00000200  # DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP
+    else:
+        kw["start_new_session"] = True
     subprocess.Popen(args, **kw)
     deadline = time.monotonic() + wait_seconds
     last = ""
@@ -726,10 +797,10 @@ async def open_obs(scene_collection: str | None = None, profile: str | None = No
         await asyncio.sleep(1.5)
         try:
             await obs.ensure()
-            return {"started": True, "exe": exe, **obs.info}
+            return {"started": True, "exe": exe, **({"websocket": ws["changed"]} if ws["changed"] else {}), **obs.info}
         except OBSError as e:
             last = str(e)
-    return {"started": True, "connected": False, "message": "OBS avviato ma il websocket non risponde: " + last}
+    return {"started": True, "connected": False, "exe": exe, "message": "OBS avviato ma il websocket non risponde ancora: " + last}
 
 
 # ---------------------------------------------------------------------------
@@ -1792,6 +1863,18 @@ def costruisci_scena(descrizione: str) -> str:
 def main() -> None:
     if "--version" in sys.argv:
         print(VERSION)
+        return
+    if "--open" in sys.argv:  # uv run --script obs_mcp.py --open  -> apre OBS da solo, senza Claude
+        args = sys.argv[sys.argv.index("--open") + 1:]
+        kw = {"scene_collection": None, "scene": None, "profile": None}
+        for flag, key in (("--collection", "scene_collection"), ("--scene", "scene"), ("--profile", "profile")):
+            if flag in args and args.index(flag) + 1 < len(args):
+                kw[key] = args[args.index(flag) + 1]
+        try:
+            print(json.dumps(asyncio.run(open_obs(**kw, minimize_to_tray="--tray" in args)), indent=2, ensure_ascii=False))
+        except OBSError as e:
+            print("errore:", e)
+            sys.exit(1)
         return
     mcp.run()
 

@@ -10,6 +10,7 @@ import json
 import os
 import struct
 import sys
+import time
 import zlib
 from pathlib import Path
 
@@ -544,7 +545,7 @@ class FakeOBS:
     # ---- outputs
     def r_GetStreamStatus(self, d):
         return {"outputActive": self.st.stream, "outputReconnecting": False, "outputTimecode": "00:01:02.000", "outputDuration": 62000,
-                "outputCongestion": 0.0, "outputBytes": 1_000_000, "outputSkippedFrames": 0, "outputTotalFrames": 3600}
+                "outputCongestion": 0.0, "outputBytes": 1_000_000 + (int(time.monotonic() * 750_000) if getattr(self.st, "grow", False) else 0), "outputSkippedFrames": 0, "outputTotalFrames": 3600}
 
     async def r_StartStream(self, d):
         if self.st.stream:
@@ -635,6 +636,78 @@ class FakeOBS:
 
     def r_OffsetMediaInputCursor(self, d):
         self.st.cursor[d["inputName"]] = self.st.cursor.get(d["inputName"], 1000) + d["mediaCursorOffset"]
+
+
+    # ---- 1.2: outputs, persistent data, vendor, per-scene transitions
+    def _outs(self):
+        if not hasattr(self, "_o"):
+            self._o = {"adv_stream": {"outputKind": "rtmp_output", "active": False, "settings": {"bitrate": 6000}},
+                       "virtualcam_output": {"outputKind": "virtualcam_output", "active": False, "settings": {}}}
+            self._pd = {}
+            self._tov = {}
+            self._bytes = 0
+        return self._o
+
+    def r_GetOutputList(self, d):
+        return {"outputs": [{"outputName": n, "outputKind": o["outputKind"], "outputActive": o["active"], "outputWidth": 1280, "outputHeight": 720}
+                            for n, o in self._outs().items()]}
+
+    def _out(self, d):
+        o = self._outs().get(d["outputName"])
+        if not o:
+            raise Fail(600, "No output was found by the name of `%s`." % d["outputName"])
+        return o
+
+    def r_GetOutputStatus(self, d):
+        o = self._out(d)
+        return {"outputActive": o["active"], "outputReconnecting": False, "outputTimecode": "00:00:10.000", "outputCongestion": 0.0,
+                "outputBytes": 2_000_000, "outputSkippedFrames": 0, "outputTotalFrames": 600}
+
+    def r_StartOutput(self, d):
+        self._out(d)["active"] = True
+
+    def r_StopOutput(self, d):
+        self._out(d)["active"] = False
+
+    def r_ToggleOutput(self, d):
+        o = self._out(d)
+        o["active"] = not o["active"]
+
+    def r_GetOutputSettings(self, d):
+        return {"outputSettings": self._out(d)["settings"]}
+
+    def r_SetOutputSettings(self, d):
+        self._out(d)["settings"].update(d["outputSettings"])
+
+    def r_GetPersistentData(self, d):
+        self._outs()
+        return {"slotValue": self._pd.get((d["realm"], d["slotName"]))}
+
+    def r_SetPersistentData(self, d):
+        self._outs()
+        self._pd[(d["realm"], d["slotName"])] = d["slotValue"]
+
+    def r_CallVendorRequest(self, d):
+        if d["vendorName"] != "obs-browser":
+            raise Fail(604, "No vendor was found by that name.")
+        return {"vendorName": d["vendorName"], "requestType": d["requestType"], "responseData": {"ok": True}}
+
+    async def r_BroadcastCustomEvent(self, d):
+        await self.emit("CustomEvent", d["eventData"], 1)
+
+    def r_GetSceneSceneTransitionOverride(self, d):
+        self._outs()
+        self.st.scene(d["sceneName"])
+        return self._tov.get(d["sceneName"], {"transitionName": None, "transitionDuration": None})
+
+    def r_SetSceneSceneTransitionOverride(self, d):
+        self._outs()
+        self.st.scene(d["sceneName"])
+        cur = self._tov.setdefault(d["sceneName"], {"transitionName": None, "transitionDuration": None})
+        if "transitionName" in d:
+            cur["transitionName"] = d["transitionName"]
+        if "transitionDuration" in d:
+            cur["transitionDuration"] = d["transitionDuration"]
 
     # ---- screenshots
     def r_GetSourceActive(self, d):

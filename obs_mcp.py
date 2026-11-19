@@ -42,7 +42,7 @@ except Exception:  # mcp 2.x renamed FastMCP to MCPServer
     from mcp.server.mcpserver.exceptions import ToolError  # type: ignore
 from mcp.types import ToolAnnotations
 
-VERSION = "1.1.1"
+VERSION = "1.2.0"
 RO = ToolAnnotations(readOnlyHint=True)
 DESTRUCTIVE = ToolAnnotations(destructiveHint=True)
 
@@ -311,11 +311,11 @@ class OBS:
             self.pending.pop(rid, None)
             raise OBSError(f"OBS non ha risposto entro {timeout:.0f}s (una finestra di dialogo aperta in OBS può bloccarlo)") from None
 
-    async def call(self, rtype: str, data: dict | None = None, timeout: float = 15) -> dict:
+    async def call(self, rtype: str, data: dict | None = None, timeout: float = 15, keep_none: bool = False) -> dict:
         rid = uuid.uuid4().hex
         d: dict[str, Any] = {"requestType": rtype, "requestId": rid}
         if data:
-            d["requestData"] = {k: v for k, v in data.items() if v is not None}
+            d["requestData"] = dict(data) if keep_none else {k: v for k, v in data.items() if v is not None}
         r = await self._send(6, d, rid, timeout)
         st = r.get("requestStatus", {})
         if not st.get("result"):
@@ -1849,6 +1849,266 @@ async def look(action: str = "list", name: str | None = None, scene: str | None 
 
 
 # ---------------------------------------------------------------------------
+# 1.2: outputs, persistent data, plugins (vendor requests), per-scene transitions,
+# source inspection, stream health, countdown
+# ---------------------------------------------------------------------------
+
+
+@mcp.tool()
+async def outputs(action: str = "list", name: str | None = None, settings: dict | None = None, confirm: bool = False) -> dict:
+    """All OBS outputs, including the ones added by plugins (Aitum Multistream/Vertical, NDI, Source Record, ...).
+    action: list | status | settings (read, or write with settings=) | start | stop (needs confirm=true) | toggle."""
+    if action == "list":
+        outs = (await obs.call("GetOutputList"))["outputs"]
+        return {"outputs": [{"name": o.get("outputName"), "kind": o.get("outputKind"), "active": o.get("outputActive"),
+                             "size": f"{o.get('outputWidth')}x{o.get('outputHeight')}"} for o in outs]}
+    if not name:
+        raise OBSError("serve name (vedi outputs action='list')")
+    base = {"outputName": name}
+    if action == "start":
+        await obs.call("StartOutput", base)
+    elif action in ("stop", "toggle"):
+        if not confirm:
+            return need_confirm(f"{action} dell'uscita '{name}'")
+        await obs.call("StopOutput" if action == "stop" else "ToggleOutput", base)
+    elif action == "settings":
+        if settings:
+            if not confirm:
+                return need_confirm(f"cambiare le impostazioni dell'uscita '{name}'")
+            await obs.call("SetOutputSettings", {**base, "outputSettings": settings})
+        return {"name": name, "settings": mask_secrets((await obs.call("GetOutputSettings", base)).get("outputSettings", {}))}
+    elif action != "status":
+        raise OBSError("action: list | status | settings | start | stop | toggle")
+    s = await obs.call("GetOutputStatus", base)
+    return {"name": name, "active": s.get("outputActive"), "reconnecting": s.get("outputReconnecting"),
+            "timecode": s.get("outputTimecode"), "congestion": s.get("outputCongestion"),
+            "mb": round((s.get("outputBytes") or 0) / 1e6, 1), "skipped_frames": s.get("outputSkippedFrames"),
+            "total_frames": s.get("outputTotalFrames")}
+
+
+REALMS = {"global": "OBS_WEBSOCKET_DATA_REALM_GLOBAL", "profile": "OBS_WEBSOCKET_DATA_REALM_PROFILE"}
+
+
+@mcp.tool()
+async def persistent_data(key: str, value: Any = None, realm: str = "global", delete: bool = False) -> dict:
+    """Small notes stored INSIDE OBS (they survive restarts): read when value is omitted, write otherwise.
+    realm: global (all profiles) | profile (only the current profile). Handy for show notes, counters, last scene."""
+    r = REALMS.get(realm)
+    if not r:
+        raise OBSError("realm: global | profile")
+    if delete:
+        await obs.call("SetPersistentData", {"realm": r, "slotName": key, "slotValue": None}, keep_none=True)
+        return {"done": True, "deleted": key}
+    if value is not None:
+        await obs.call("SetPersistentData", {"realm": r, "slotName": key, "slotValue": value})
+    got = await obs.call("GetPersistentData", {"realm": r, "slotName": key})
+    return {"key": key, "realm": realm, "value": got.get("slotValue")}
+
+
+KNOWN_VENDORS = {
+    "AdvancedSceneSwitcher": "Advanced Scene Switcher (macro: AdvancedSceneSwitcherMessage)",
+    "aitum-vertical-canvas": "Aitum Vertical (scene verticali, stream/record verticale)",
+    "move": "Move transition / Move value",
+    "obs-shaderfilter": "Shader filter",
+    "downstream-keyer": "Downstream Keyer",
+    "source-record": "Source Record",
+    "obs-browser": "Browser source (emit_event)",
+}
+
+
+@mcp.tool()
+async def vendor_request(vendor: str | None = None, request: str | None = None, data: dict | None = None) -> dict:
+    """Talk to OBS plugins that register obs-websocket vendor requests (Advanced Scene Switcher, Aitum Vertical,
+    Downstream Keyer, Move, obs-browser 'emit_event', ...). Without vendor returns the list of common vendor names.
+    Example: vendor='obs-browser', request='emit_event', data={'event_name': 'alert', 'event_data': {...}}."""
+    if not vendor or not request:
+        return {"known_vendors": KNOWN_VENDORS, "hint": "se il plugin non è installato OBS risponde 'vendor not found'"}
+    r = await obs.call("CallVendorRequest", {"vendorName": vendor, "requestType": request, "requestData": data or {}}, timeout=30)
+    return {"vendor": vendor, "request": request, "response": mask_secrets(r.get("responseData", r))}
+
+
+@mcp.tool()
+async def broadcast_event(data: dict) -> dict:
+    """Send a custom event to every client connected to obs-websocket (overlays, Stream Deck, bots, your own pages).
+    They receive it as 'CustomEvent'. Example: {'type': 'goal', 'value': 50}."""
+    await obs.call("BroadcastCustomEvent", {"eventData": data})
+    return {"done": True, "sent": data}
+
+
+@mcp.tool()
+async def scene_transition(scene: str, transition: str | None = None, duration_ms: int | None = None, clear: bool = False) -> dict:
+    """Per-scene transition override: when OBS switches TO this scene it uses this transition/duration instead of the
+    global one. Without transition/duration it just reads the override. clear=true removes it."""
+    base = {"sceneName": scene}
+    if clear:
+        await obs.call("SetSceneSceneTransitionOverride", {**base, "transitionName": None, "transitionDuration": None}, keep_none=True)
+    elif transition is not None or duration_ms is not None:
+        d: dict[str, Any] = dict(base)
+        if transition is not None:
+            d["transitionName"] = transition
+        if duration_ms is not None:
+            d["transitionDuration"] = max(50, min(20000, int(duration_ms)))
+        await obs.call("SetSceneSceneTransitionOverride", d)
+    o = await obs.call("GetSceneSceneTransitionOverride", base)
+    return {"scene": scene, "transition": o.get("transitionName"), "duration_ms": o.get("transitionDuration")}
+
+
+@mcp.tool(annotations=RO)
+async def source_info(name: str) -> dict:
+    """Everything about one source in one call: kind, settings (secrets hidden), whether it is live on program/preview,
+    which scenes use it (and if it is visible there), audio state, filters and media state."""
+    lst = (await obs.call("GetInputList"))["inputs"]
+    inp = next((i for i in lst if i["inputName"] == name), None)
+    scenes = [s["sceneName"] for s in (await obs.call("GetSceneList"))["scenes"]]
+    is_scene = name in scenes
+    if not inp and not is_scene:
+        near = [i["inputName"] for i in lst if name.lower() in i["inputName"].lower()]
+        raise OBSError(f"sorgente '{name}' non trovata" + (f". Forse: {', '.join(near[:8])}" if near else ""))
+    out: dict[str, Any] = {"name": name, "type": "scene" if is_scene and not inp else "input"}
+    if inp:
+        kind = inp.get("inputKind") or inp.get("unversionedInputKind")
+        out["kind"] = kind
+        out["settings"] = mask_secrets((await obs.call("GetInputSettings", {"inputName": name})).get("inputSettings", {}))
+    act = await obs.try_call("GetSourceActive", {"sourceName": name}) or {}
+    out["on_program"], out["showing"] = act.get("videoActive"), act.get("videoShowing")
+    used = []
+    for sc in scenes:
+        items = (await obs.try_call("GetSceneItemList", {"sceneName": sc}) or {}).get("sceneItems", [])
+        for i in items:
+            if i["sourceName"] == name:
+                used.append({"scene": sc, "id": i["sceneItemId"], "visible": i["sceneItemEnabled"]})
+    out["used_in"] = used
+    if inp:
+        vol = await obs.try_call("GetInputVolume", {"inputName": name})
+        if vol:
+            mute = await obs.try_call("GetInputMute", {"inputName": name}) or {}
+            out["audio"] = {"volume_db": round(vol["inputVolumeDb"], 1), "muted": mute.get("inputMuted")}
+        med = await obs.try_call("GetMediaInputStatus", {"inputName": name})
+        if med and med.get("mediaState") not in (None, "OBS_MEDIA_STATE_NONE"):
+            out["media"] = {"state": str(med.get("mediaState")).replace("OBS_MEDIA_STATE_", "").lower(),
+                            "position_s": round((med.get("mediaCursor") or 0) / 1000, 1), "length_s": round((med.get("mediaDuration") or 0) / 1000, 1)}
+    flt = await obs.try_call("GetSourceFilterList", {"sourceName": name}) or {}
+    out["filters"] = [{"name": f["filterName"], "kind": f["filterKind"], "enabled": f["filterEnabled"]} for f in flt.get("filters", [])]
+    if not used and not is_scene:
+        out["warning"] = "non è in nessuna scena: non si vede né si sente in uscita (a parte l'audio globale)"
+    return out
+
+
+@mcp.tool(annotations=RO)
+async def stream_health(seconds: float = 5.0) -> dict:
+    """Measures the live output for a few seconds: real bitrate (kbps), dropped/lagged frames in the window, congestion,
+    CPU, render time and disk, for stream and recording. Ends with a verdict and what to change."""
+    seconds = max(1.0, min(60.0, seconds))
+
+    async def snap():
+        res = await obs.batch([{"requestType": t} for t in ("GetStats", "GetStreamStatus", "GetRecordStatus")])
+        return [(x.get("responseData") or {}) if x.get("requestStatus", {}).get("result") else {} for x in res]
+
+    t0 = time.monotonic()
+    a = await snap()
+    await asyncio.sleep(seconds)
+    b = await snap()
+    dt = time.monotonic() - t0
+    out: dict[str, Any] = {"seconds": round(dt, 1)}
+    issues: list[str] = []
+    for label, i in (("stream", 1), ("record", 2)):
+        x, y = a[i], b[i]
+        if not y.get("outputActive"):
+            out[label] = {"active": False}
+            continue
+        kbps = max(0, (y.get("outputBytes", 0) - x.get("outputBytes", 0))) * 8 / 1000 / dt
+        sk = max(0, y.get("outputSkippedFrames", 0) - x.get("outputSkippedFrames", 0))
+        tot = max(1, y.get("outputTotalFrames", 0) - x.get("outputTotalFrames", 0))
+        info = {"active": True, "kbps": round(kbps), "dropped_frames": sk, "dropped_percent": round(100 * sk / tot, 2)}
+        if label == "stream":
+            info["congestion"] = round(y.get("outputCongestion") or 0, 3)
+            info["reconnecting"] = y.get("outputReconnecting")
+            if y.get("outputReconnecting"):
+                issues.append("la diretta si sta riconnettendo: rete instabile")
+            if info["dropped_percent"] > 1 or info["congestion"] > 0.2:
+                issues.append("frame persi in rete: abbassa il bitrate o usa il cavo al posto del Wi-Fi")
+            if kbps < 500:
+                issues.append("bitrate molto basso: controlla la connessione o il bitrate impostato")
+        out[label] = info
+    s0, s1 = a[0], b[0]
+    rend = max(0, s1.get("renderSkippedFrames", 0) - s0.get("renderSkippedFrames", 0))
+    rtot = max(1, s1.get("renderTotalFrames", 0) - s0.get("renderTotalFrames", 0))
+    enc = max(0, s1.get("outputSkippedFrames", 0) - s0.get("outputSkippedFrames", 0))
+    etot = max(1, s1.get("outputTotalFrames", 0) - s0.get("outputTotalFrames", 0))
+    out["system"] = {"cpu_percent": round(s1.get("cpuUsage", 0), 1), "fps": round(s1.get("activeFps", 0), 1),
+                     "render_ms": round(s1.get("averageFrameRenderTime", 0), 2),
+                     "render_lag_percent": round(100 * rend / rtot, 2), "encoder_lag_percent": round(100 * enc / etot, 2),
+                     "memory_mb": round(s1.get("memoryUsage", 0)), "disk_free_gb": round(s1.get("availableDiskSpace", 0) / 1024, 1)}
+    sy = out["system"]
+    if sy["render_lag_percent"] > 1:
+        issues.append("la GPU non ce la fa (frame saltati in render): togli filtri/sorgenti pesanti o limita gli FPS del gioco")
+    if sy["encoder_lag_percent"] > 1:
+        issues.append("l'encoder è sovraccarico: usa NVENC, un preset più veloce o una risoluzione di uscita più bassa")
+    if sy["cpu_percent"] > 85:
+        issues.append("CPU quasi al massimo")
+    if sy["disk_free_gb"] and sy["disk_free_gb"] < 10 and out.get("record", {}).get("active"):
+        issues.append("meno di 10 GB liberi sul disco della registrazione")
+    out["verdict"] = "ok" if not issues else "problemi"
+    out["issues"] = issues
+    return out
+
+
+_countdowns: dict[str, asyncio.Task] = {}
+
+
+def _fmt_left(sec: int, fmt: str) -> str:
+    h, rem = divmod(max(0, sec), 3600)
+    mnt, s = divmod(rem, 60)
+    return fmt.replace("{h}", str(h)).replace("{mm}", f"{mnt:02d}").replace("{m}", str(mnt + 60 * h if "{h}" not in fmt else mnt)).replace("{ss}", f"{s:02d}")
+
+
+@mcp.tool()
+async def countdown(text_source: str, action: str = "start", seconds: int | None = None, until: str | None = None,
+                    format: str = "{m}:{ss}", end_text: str = "", end_scene: str | None = None) -> dict:
+    """Live countdown on a text source (e.g. 'starting soon'): updates every second in the background.
+    seconds=300 or until='21:00' (local time). format: {h} {m} {mm} {ss}, e.g. 'Si parte tra {m}:{ss}'.
+    At zero writes end_text and, if given, switches to end_scene. action: start | stop | status."""
+    if action == "status":
+        return {"running": sorted(k for k, t in _countdowns.items() if not t.done())}
+    old = _countdowns.pop(text_source, None)
+    if old and not old.done():
+        old.cancel()
+    if action == "stop":
+        return {"done": True, "stopped": text_source if old else None}
+    if action != "start":
+        raise OBSError("action: start | stop | status")
+    await obs.call("GetInputSettings", {"inputName": text_source})  # exists?
+    if until:
+        hh, mm = (int(x) for x in until.split(":")[:2])
+        now = time.localtime()
+        target = time.mktime((now.tm_year, now.tm_mon, now.tm_mday, hh, mm, 0, 0, 0, -1))
+        if target <= time.time():
+            target += 86400
+    elif seconds:
+        target = time.time() + int(seconds)
+    else:
+        raise OBSError("serve seconds o until")
+
+    async def run():
+        try:
+            while True:
+                left = int(round(target - time.time()))
+                if left <= 0:
+                    break
+                await obs.try_call("SetInputSettings", {"inputName": text_source, "inputSettings": {"text": _fmt_left(left, format)}, "overlay": True})
+                await asyncio.sleep(max(0.05, (target - time.time()) - (left - 1)))
+            await obs.try_call("SetInputSettings", {"inputName": text_source, "inputSettings": {"text": end_text}, "overlay": True})
+            if end_scene:
+                await obs.try_call("SetCurrentProgramScene", {"sceneName": end_scene})
+        except asyncio.CancelledError:
+            pass
+
+    _countdowns[text_source] = asyncio.create_task(run())
+    left = int(round(target - time.time()))
+    return {"done": True, "source": text_source, "seconds": left, "first_text": _fmt_left(left, format), "end_scene": end_scene}
+
+
+# ---------------------------------------------------------------------------
 # Prompts
 # ---------------------------------------------------------------------------
 
@@ -1860,6 +2120,14 @@ def prepara_diretta(piattaforma: str = "Twitch") -> str:
             "mentre parlo al microfono. 3) screenshot del program per vedere cosa uscirà. 4) Elencami i problemi in ordine "
             "di gravità con la correzione, e correggi da solo quelli sicuri (volumi, filtri voce con clean_mic, file mancanti) "
             "chiedendomi prima di tutto ciò che cambia la destinazione o le impostazioni video. Non avviare la diretta: lo decido io.")
+
+
+@mcp.prompt()
+def controlla_diretta() -> str:
+    """Controllo della diretta in corso, senza interromperla."""
+    return ("La diretta OBS è in corso. stream_health con seconds=10, poi audio_levels per 3 secondi. Dimmi in due righe se va "
+            "tutto bene; se no, la causa più probabile e la correzione. Non fermare stream o registrazione e non cambiare "
+            "bitrate o encoder senza chiedermelo.")
 
 
 @mcp.prompt()

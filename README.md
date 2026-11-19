@@ -28,7 +28,7 @@ Variabili opzionali: `OBS_URL` (default `ws://127.0.0.1:4455`), `OBS_PASSWORD`, 
 Prova con OBS aperto: `uv run --script check_live.py` (crea una scena temporanea `_aj_check` e la cancella; non tocca diretta, registrazione né le tue scene).
 Prova senza OBS: `uv run --with "mcp[cli]>=1.10,<3" python tests/test_offline.py` (finto OBS in `tests/fake_obs.py`).
 
-## Tool (55) e prompt (2)
+## Tool (63) e prompt (3)
 
 | Area | Tool |
 |---|---|
@@ -44,9 +44,12 @@ Prova senza OBS: `uv run --with "mcp[cli]>=1.10,<3" python tests/test_offline.py
 | Vista | `screenshot` (program, preview o qualsiasi sorgente; Claude vede l'immagine) |
 | Configurazione | `scene_collections`, `profiles`, `video_settings`, `record_directory` |
 | Finestre | `open_projector` (program, preview, multiview, sorgente su monitor), `open_dialog` |
+| Plugin e uscite extra (1.2) | `outputs` (tutte le uscite, anche quelle dei plugin: Aitum Multistream/Vertical, NDI, Source Record; stato, avvio, stop, impostazioni), `vendor_request` (Advanced Scene Switcher, Aitum Vertical, Downstream Keyer, Move, obs-browser…), `broadcast_event` (evento custom a overlay, Stream Deck, bot) |
+| Dati e diagnosi (1.2) | `persistent_data` (note salvate dentro OBS, globali o per profilo), `source_info` (tutto su una sorgente: in quali scene è, se è in onda, audio, filtri, media), `stream_health` (bitrate reale in kbps, frame persi nella finestra, GPU/encoder in ritardo, con verdetto e correzione) |
+| Regia (1.2) | `scene_transition` (transizione e durata diverse per scena), `countdown` (conto alla rovescia su una sorgente testo, fino a N secondi o a un orario, poi cambia scena) |
 | Pipeline | `show_check` (controllo pre-diretta: fps, GPU, encoder, rete, disco, file mancanti, microfoni muti o silenziosi, scene vuote), `build_scene` (scena intera in una chiamata; se qualcosa fallisce non lascia niente a metà), `look` (salva e richiama visibilità + volumi, con dissolvenza audio) |
 
-Prompt: `prepara_diretta`, `costruisci_scena`.
+Prompt: `prepara_diretta`, `costruisci_scena`, `controlla_diretta` (salute della diretta in corso senza toccarla).
 
 ## Con il resto dell'hub
 
@@ -55,5 +58,5 @@ Il ponte con Resolume passa da Spout: in `resolume-mcp` c'è `obs_bridge`; qui `
 ## Confronto (novembre 2026)
 
 - **obs-mcp (PyPI, 148 tool)**: copre tutto il protocollo con un tool per richiesta, ha `clean_audio_input` e `diagnose_av_health`; non ha i lotti di richieste. Qui gli stessi casi passano da `obs_request`/`obs_batch` più tool pensati per il lavoro vero (layout preset, `build_scene` con annullamento, look, livelli audio reali, fade, conferme e chiave nascosta).
-- **royshil/obs-mcp (npm)**: generale, scene, sorgenti, elementi, stream/registrazione, transizioni; niente screenshot, filtri o audio dettagliato.
+- **royshil/obs-mcp (npm, ora ~200 tool)**: un tool per richiesta, comprese richieste vendor, eventi custom, dati persistenti e uscite generiche. Con la 1.2 queste aree hanno un tool dedicato anche qui; in più `stream_health` misura il bitrate reale e `countdown` lavora in background.
 - **obs-studio-mcp (PyPI)**, **obs_mcp (Dart)**, **obs-controller**: coperture simili, nessuno ha lotti con `Sleep`, eventi in attesa, livelli audio o pipeline con annullamento.

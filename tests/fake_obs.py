@@ -586,6 +586,8 @@ class FakeOBS:
         pass
 
     def r_GetReplayBufferStatus(self, d):
+        if getattr(self.st, "replay_off", False):
+            raise Fail(604, "Replay buffer is not available.")
         return {"outputActive": self.st.replay}
 
     def r_StartReplayBuffer(self, d):
@@ -635,6 +637,10 @@ class FakeOBS:
         self.st.cursor[d["inputName"]] = self.st.cursor.get(d["inputName"], 1000) + d["mediaCursorOffset"]
 
     # ---- screenshots
+    def r_GetSourceActive(self, d):
+        n = d["sourceName"]
+        return {"videoActive": n == self.st.program, "videoShowing": n == self.st.program}
+
     def r_GetSourceScreenshot(self, d):
         if d["sourceName"] not in self.st.inputs and not any(s["name"] == d["sourceName"] for s in self.st.scenes):
             raise Fail(600, "No source was found.")

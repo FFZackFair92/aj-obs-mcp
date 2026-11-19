@@ -230,6 +230,10 @@ async def main():
     r = await m.replay_buffer("save")
     check("replay_buffer save -> file", r["file"] and "Replay" in r["file"], r)
     await m.replay_buffer("stop")
+    st.replay_off = True
+    r = await m.replay_buffer("status")
+    check("replay_buffer spento nelle impostazioni spiegato", r["available"] is False and "Impostazioni" in r["message"], r)
+    st.replay_off = False
     r = await m.virtual_cam("start")
     check("virtual_cam", r["active"])
     await m.virtual_cam("stop")
@@ -248,6 +252,9 @@ async def main():
     out = Path(tempfile.mkdtemp()) / "shot.png"
     r = await m.screenshot(save_path=str(out), format="png")
     check("screenshot", isinstance(r[0], m.Image) and out.exists() and "Scena" in r[1])
+    n_before = fake.requests_seen.count("GetSourceScreenshot")
+    await m.screenshot("Vuota", width=320)
+    check("screenshot sveglia la scena fuori onda", fake.requests_seen.count("GetSourceScreenshot") - n_before == 2)
     res = await m.mcp.call_tool("screenshot", {"source": "Webcam", "width": 640})
     check("screenshot via MCP (contenuto immagine)", "image" in str(res).lower(), str(res)[:200])
 

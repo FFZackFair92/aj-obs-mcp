@@ -42,7 +42,7 @@ except Exception:  # mcp 2.x renamed FastMCP to MCPServer
     from mcp.server.mcpserver.exceptions import ToolError  # type: ignore
 from mcp.types import ToolAnnotations
 
-VERSION = "1.1.0"
+VERSION = "1.1.1"
 RO = ToolAnnotations(readOnlyHint=True)
 DESTRUCTIVE = ToolAnnotations(destructiveHint=True)
 
@@ -1410,6 +1410,10 @@ async def record(action: str = "status", chapter: str | None = None, confirm: bo
 async def replay_buffer(action: str = "status") -> dict:
     """Replay buffer: status | start | stop | save (saves the last N seconds and returns the file path)."""
     out: dict[str, Any] = {}
+    if (await obs.try_call("GetReplayBufferStatus")) is None:
+        return {"available": False, "active": False,
+                "message": "Replay buffer non attivo in questo profilo: OBS > Impostazioni > Uscita > Replay Buffer > "
+                           "Abilita Replay Buffer (con la durata in secondi), poi OK."}
     if action == "start":
         await obs.call("StartReplayBuffer")
     elif action == "stop":
@@ -1510,6 +1514,12 @@ async def screenshot(source: str | None = None, width: int = 1280, format: str =
         source = (await obs.call("GetCurrentPreviewScene"))["currentPreviewSceneName"]
     fmt = "jpg" if format.lower() in ("jpg", "jpeg") else "png"
     width = max(8, min(4096, int(width)))
+    # OBS renders a scene/source that is not on screen only when something looks at it: the first capture of a
+    # hidden scene comes out empty or stale. Wake it with a tiny capture and give it a few frames.
+    act = await obs.try_call("GetSourceActive", {"sourceName": source}) or {}
+    if not act.get("videoShowing"):
+        await obs.try_call("GetSourceScreenshot", {"sourceName": source, "imageFormat": "png", "imageWidth": 8})
+        await asyncio.sleep(0.3)
     if save_path:
         await obs.call("SaveSourceScreenshot", {"sourceName": source, "imageFormat": fmt, "imageFilePath": save_path, "imageCompressionQuality": -1})
     r = await obs.call("GetSourceScreenshot", {"sourceName": source, "imageFormat": fmt, "imageWidth": width,

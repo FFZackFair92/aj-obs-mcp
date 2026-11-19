@@ -74,8 +74,8 @@ async def main():
 
     print("\npulizia")
     await step("remove_scene", m.remove_scene(TMP, confirm=True))
-    for n in ("_aj_fondo", "_aj_testo"):
-        await step(f"remove_input {n}", m.remove_input(n, confirm=True))
+    for n in ("_aj_fondo", "_aj_testo"):  # OBS may already have dropped sources left without a scene
+        await m.obs.try_call("RemoveInput", {"inputName": n})
 
     bad = sum(not r[0] for r in results)
     print(f"\n{len(results) - bad} ok, {bad} falliti")
